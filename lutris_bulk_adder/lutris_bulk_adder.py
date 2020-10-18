@@ -1,10 +1,11 @@
-import re
-import os
-import sys
 import argparse
-import yaml
+import os
+import re
 import sqlite3
+import sys
 from datetime import datetime
+
+import yaml
 
 DEFAULT_ROM_FILE_EXTS = ['iso', 'zip', 'sfc', 'gba', 'gbc', 'gb', 'md', 'n64',
                          'nes', '32x', 'gg', 'sms', 'bin']
@@ -67,6 +68,7 @@ PLATFORMS = [
     'Z-Machine'
 ]
 
+
 def option_list(options):
     """Option list type for argparse
 
@@ -86,10 +88,10 @@ def option_list(options):
         parsed = pair.split('=', maxsplit=1)
         if len(parsed) < 2:
             raise argparse.ArgumentTypeError("Option \"{}\" is not formatted correctly".format(pair))
-        
+
         pairs.update({parsed[0]: parsed[1]})
-    
-    return(pairs)
+
+    return (pairs)
 
 
 def directory(path):
@@ -130,7 +132,7 @@ def scan_for_filetypes(dir, types):
             if entity.is_file():
                 fn_delimited = entity.name.split(os.extsep)
                 try:
-                    if(fn_delimited[len(fn_delimited) - 1].lower() in types):
+                    if (fn_delimited[len(fn_delimited) - 1].lower() in types):
                         files.add(os.path.join(dir, entity.name))
                 except IndexError:
                     pass
@@ -139,7 +141,7 @@ def scan_for_filetypes(dir, types):
 
 def main():
     parser = argparse.ArgumentParser(description='Scan a directory for ROMs to add to Lutris.')
-    
+
     # Required arguments
     parser.add_argument('-d', '--directory', type=directory, required=True,
                         help='Directory to scan for games.')
@@ -170,6 +172,10 @@ def main():
                         help="""
 Do not write YML files or alter Lutris database, only print data to be written out to stdout. (i.e. dry run)
     """)
+    parser.add_argument('-cf', '--cache-file', type=str,
+                        default=os.path.join(os.path.expanduser('~'), '.local', 'share', 'lutris-bulk-adder',
+                                             'imports.yml'),
+                        help='File to store past imports in')
 
     args = parser.parse_args()
 
@@ -188,21 +194,33 @@ Do not write YML files or alter Lutris database, only print data to be written o
         print("SQLite error, is {} a valid Lutris database?".format(args.lutris_database))
         sys.exit(1)
     game_id = cur.fetchone()[0] + 1
-    
+
+    cache = []
+    if os.path.isfile(args.cache_file):
+        with open(args.cache_file, 'r') as f:
+            cache = yaml.safe_load(f)
+    else:
+        cache_dir = os.path.dirname(args.cache_file)
+        os.makedirs(cache_dir, exist_ok=True)
+
     # Scan dir for ROMs
     files = scan_for_filetypes(args.directory, args.file_types)
     for file in files:
         ts = int(datetime.utcnow().timestamp())
 
+        if any(map(has_file_in_cache(file), cache)):
+            print("already got file {}".format(file))
+            continue
+
         # Generate game name and slug from filename
         game = re.sub(r"\..*", "", os.path.basename(file))  # Strip extension
         for token in args.strip_filename:
-            game = game.replace(token, "")                  # Strip tokens
-        game = re.sub(r"\s+", " ", game).strip(" ")         # Remove excess whitespace
+            game = game.replace(token, "")  # Strip tokens
+        game = re.sub(r"\s+", " ", game).strip(" ")  # Remove excess whitespace
 
-        slug = re.sub(r"[^0-9A-Za-z']", " ", game)          # Split on nonword characters
-        slug = slug.replace("'", "")                        # Strip apostrophe
-        slug = re.sub(r"\s+", "-", slug).strip("-").lower() # Replace whitespace with dashes
+        slug = re.sub(r"[^0-9A-Za-z']", " ", game)  # Split on nonword characters
+        slug = slug.replace("'", "")  # Strip apostrophe
+        slug = re.sub(r"\s+", "-", slug).strip("-").lower()  # Replace whitespace with dashes
 
         # Data for YML file
         config_file = '{slug}-{ts}'.format(slug=slug, ts=ts)
@@ -218,6 +236,8 @@ Do not write YML files or alter Lutris database, only print data to be written o
         if args.game_options is not None:
             config['game'].update(args.game_options)
 
+        game_dir = os.path.join(args.lutris_game_dir, slug)
+
         # Data for Lutris DB
         values = {
             "id": game_id,
@@ -228,7 +248,7 @@ Do not write YML files or alter Lutris database, only print data to be written o
             "platform": args.platform,
             "runner": args.runner,
             "executable": None,
-            "directory": args.lutris_game_dir,
+            "directory": game_dir,
             "updated": None,
             "lastplayed": 0,
             "installed": 1,
@@ -241,27 +261,50 @@ Do not write YML files or alter Lutris database, only print data to be written o
             "playtime": None
         }
 
+        cache_entry = {
+            "id": game_id,
+            "rom": file,
+            "slug": slug,
+            "config_path": config_file
+        }
+        cache.append(cache_entry)
+
         # Output to console
         if args.no_write:
             print("file: {}".format(file))
             print("SQLite:\n{}".format(values)),
             print("YML at {ymlfile}:\n{config}\n".format(ymlfile=config_file_path,
                                                          config=yaml.dump(config, default_flow_style=False)))
-        
+
         # Write to DB/filesystem
         else:
+            os.makedirs(game_dir, exist_ok=True)
             with open(config_file_path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
-            
+
             query = "INSERT INTO games ({columns}) VALUES ({placeholders})".format(
-                columns = ','.join(values.keys()),
-                placeholders = ','.join('?' * len(values))
+                columns=','.join(values.keys()),
+                placeholders=','.join('?' * len(values))
             )
 
             cur.execute(query, list(values.values()))
             conn.commit()
 
         game_id += 1
+
+    if args.no_write:
+        print("YML at {ymlfile}:\n{config}\n".format(ymlfile=args.cache_file,
+                                                     config=yaml.dump(cache, default_flow_style=False)))
+    else:
+        with open(args.cache_file, 'w') as f:
+            yaml.dump(cache, f, default_flow_style=False)
+
+
+def has_file_in_cache(file):
+    def is_in_cache(cache_entry):
+        return cache_entry['rom'] == file
+
+    return is_in_cache
 
 
 if __name__ == '__main__':
